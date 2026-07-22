@@ -5,6 +5,7 @@ import string
 import unicodedata
 import logging
 import time
+from pathlib import Path
 from difflib import get_close_matches
 
 import faiss
@@ -22,6 +23,9 @@ print("RAG FILE =", __file__)
 # CONFIGURATION
 # ==============================
 
+BASE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(dotenv_path=BASE_DIR.parent / ".env")
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -34,49 +38,34 @@ if not GROQ_API_KEY:
 client = Groq(api_key=GROQ_API_KEY)
 
 MODEL_EMBEDDING = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-# Reranker multilingue (le ms-marco classique est entraîné en anglais uniquement,
-# on utilise donc une variante multilingue adaptée au français)
 MODEL_RERANKER = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 
-INDEX_PATH = "models/index.faiss"
-CHUNKS_PATH = "models/chunks.pkl"
+INDEX_PATH = str(BASE_DIR / "index.faiss")
+CHUNKS_PATH = str(BASE_DIR / "chunks.pkl")
 
-# Modèle principal + modèle de secours
-# Le 70B n'est pas nécessaire ici : FAISS fait le travail de mémoire juridique,
-# le LLM ne fait que reformuler à partir du contexte -> un modèle léger suffit
-# et consomme beaucoup moins de quota.
 PRIMARY_MODEL = "llama-3.1-8b-instant"
 FALLBACK_MODEL = "llama-3.3-70b-versatile"
 
 MAX_RETRIES = 2
 RETRY_DELAY_SECONDS = 3
-DEFAULT_MAX_TOKENS = 800  # 1500 était surdimensionné pour des réponses de 400-700 tokens
+DEFAULT_MAX_TOKENS = 800
 
 # ==============================
 # SEUILS FAISS
 # ==============================
 
-# Nombre de candidats récupérés par FAISS avant reranking
-# (30 en base, jusqu'à 40 pour les questions larges/générales)
 FAISS_TOP_K_CANDIDATES = 30
 FAISS_TOP_K_WIDE = 40
-# Nombre de chunks finaux gardés après reranking
 RERANK_TOP_N = 8
 RERANK_TOP_N_WIDE = 10
 
 FAISS_MAX_DISTANCE = float(os.getenv("FAISS_MAX_DISTANCE", "1.2"))
-# Relevé de 0.3 -> 0.45 : le seuil précédent était trop permissif et laissait
-# passer des articles peu pertinents (ex: "droits du salarié" -> article sur
-# le service médical du travail)
 FAISS_MIN_SIMILARITY = float(os.getenv("FAISS_MIN_SIMILARITY", "0.45"))
-# En dessous de ce score, on prévient l'utilisateur que la correspondance est faible
 LOW_CONFIDENCE_THRESHOLD = float(os.getenv("LOW_CONFIDENCE_THRESHOLD", "0.55"))
 
-# Paramètres de correction orthographique
 MIN_WORD_LEN_FOR_CORRECTION = 4
 SPELLING_CUTOFF = 0.85
 
-# Mots français courants à ne jamais corriger
 COMMON_FRENCH_WORDS = {
     "combien", "comment", "pourquoi", "quand", "lequel", "laquelle",
     "lesquels", "lesquelles", "quelle", "quelles", "quel", "quels",
@@ -163,7 +152,6 @@ SYNONYMS = {
     ],
 }
 
-# Index inversé synonyme -> terme canonique
 _SYNONYM_LOOKUP = {}
 for canonical, variants in SYNONYMS.items():
     for variant in variants:
@@ -175,6 +163,8 @@ for canonical, variants in SYNONYMS.items():
 # ==============================
 
 print("Chargement FAISS...")
+print(f"[Chemins] INDEX_PATH={INDEX_PATH}")
+print(f"[Chemins] CHUNKS_PATH={CHUNKS_PATH}")
 
 if not os.path.exists(INDEX_PATH):
     raise FileNotFoundError(f"Index FAISS introuvable : {INDEX_PATH}")
@@ -314,11 +304,6 @@ def expand_with_synonyms(question):
 # RECHERCHE DOCUMENTS
 # ==============================
 
-# Détecte : "article 58", "art 58", "art.58", "l'article 58", "larticle 58",
-# "l article 58", "article n°58", "ART 45", etc.
-# L'ordre "article" avant "art" est important : sur "article 58" le moteur
-# doit essayer "article" en premier (sinon "art" matcherait puis casserait
-# sur le "icle" restant).
 ARTICLE_PATTERN = re.compile(
     r"\bl?['’]?\s*(?:article|art)\.?\s*(?:n[°o]?\.?\s*|num[eé]ro\s*)?(\d+)",
     re.IGNORECASE,
@@ -344,9 +329,6 @@ def _needs_wider_search(corrected_question):
     return bool(words & DURATION_KEYWORDS) or _is_general_question(corrected_question)
 
 
-# Questions larges/génériques ("quels sont mes droits ?", "quelles sont les
-# obligations de l'employeur ?") : un seul article ne suffit jamais à
-# répondre, il faut élargir la recherche pour couvrir plusieurs angles.
 GENERAL_QUESTION_KEYWORDS = {
     "droits", "droit", "obligations", "obligation", "regles", "règles",
     "tout", "generalites", "généralités",
@@ -372,8 +354,7 @@ def _dedupe_by_article(ranked_pairs, top_n):
     """
     Parcourt les paires (chunk, score) déjà triées par pertinence décroissante
     et ne garde qu'un seul chunk par numéro d'article (le mieux classé),
-    jusqu'à obtenir top_n articles distincts. Évite qu'un même article
-    (ex: 182) monopolise plusieurs places du contexte final.
+    jusqu'à obtenir top_n articles distincts.
     """
     seen_articles = set()
     deduped = []
@@ -398,9 +379,7 @@ def _dedupe_by_article(ranked_pairs, top_n):
 def _rerank(question, candidate_chunks, top_n=RERANK_TOP_N):
     """
     Rerank les chunks candidats avec un cross-encoder pour affiner la
-    pertinence sémantique (FAISS seul reste assez lexical/approximatif),
-    puis déduplique par article pour maximiser la diversité du contexte.
-    Retourne (chunks_reordonnes, scores_associes).
+    pertinence sémantique, puis déduplique par article.
     """
     if not candidate_chunks:
         return [], []
@@ -456,10 +435,6 @@ def search_documents(question, k=FAISS_TOP_K_CANDIDATES):
     # Recherche article exacte
     # ==========================
 
-    # On cherche d'abord dans la question brute (cas normal), puis dans la
-    # version corrigée orthographiquement (ex: "ariticle 100" -> "article 100")
-    # si rien n'a été trouvé. Sans ça, une faute de frappe sur "article" fait
-    # échouer la détection même si correct_spelling() l'a bien corrigée.
     article_num = _find_article_number(question)
     if article_num is None:
         article_num = _find_article_number(corrected_question)
@@ -472,7 +447,7 @@ def search_documents(question, k=FAISS_TOP_K_CANDIDATES):
 
         if exact_results:
             print(f"[Recherche exacte] Article {article_num}")
-            return exact_results, corrected_question, False, None
+            return exact_results[:1], corrected_question, False, None
 
     # ==========================
     # Recherche FAISS (candidats larges)
@@ -487,19 +462,6 @@ def search_documents(question, k=FAISS_TOP_K_CANDIDATES):
     vector = vector.astype("float32")
 
     scores, ids = index.search(vector, k)
-
-    print("\n" + "=" * 50)
-    print("DEBUG RETRIEVAL")
-    print(f"Question : {question}")
-    print(f"Corrigée : {corrected_question}")
-    print(f"Enrichie : {enriched_question}")
-    print(f"Scores : {scores[0][:5]}...")
-    print(f"IDs : {ids[0][:5]}...")
-
-    for idx in ids[0]:
-        if idx != -1:
-            print(f"Article trouvé : {chunks[idx]['metadata']['article_num']}")
-    print("=" * 50 + "\n")
 
     candidates = []
     max_score = None
@@ -536,6 +498,90 @@ def search_documents(question, k=FAISS_TOP_K_CANDIDATES):
     )
 
     return results, corrected_question, low_confidence, max_score
+
+# ==============================
+# FORMATAGE - VERSION NATURELLE (SANS MARKDOWN, SANS EMOJIS)
+# ==============================
+
+def format_article_response(article_content, article_num):
+    """
+    Formate la réponse pour un article spécifique - version naturelle.
+    Le LLM n'est pas appelé, on affiche directement le contenu.
+    """
+    content = article_content.strip()
+
+    # Nettoyer les en-têtes
+    content = re.sub(r'^[A-Z\s]+>.*?\n', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'^TITRE\s+[IVXLCDM]+\s*:.*?\n', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'^CHAPITRE\s+[A-Z]+\s*:.*?\n', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'^Section\s+\d+\s*:.*?\n', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'^ARTICLE\s+\d+\s*\n', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'^Art\.?\s+\d+\s*\n', '', content, flags=re.IGNORECASE)
+    content = content.strip()
+
+    return f"""{content}
+
+Références des articles : {article_num}."""
+
+
+def format_general_response(answer, articles_list):
+    """
+    Formate une réponse générale - version naturelle.
+    On ne fait que nettoyer la réponse du LLM.
+    Le LLM gère lui-même les références.
+    """
+    answer = clean_response(answer)
+    answer = re.sub(r'^\[[^\]]*\]\s*', '', answer)
+    return answer
+
+
+def format_error_response(message, suggestions=None):
+    """
+    Formate une réponse d'erreur - version naturelle.
+    """
+    if suggestions is None:
+        suggestions = [
+            "Reformulez votre question avec des termes plus précis",
+            "Utilisez des mots-clés juridiques (licenciement, salaire, congé, etc.)",
+            "Précisez le numéro d'article si vous le connaissez (ex: 'article 13')"
+        ]
+
+    suggestions_text = "\n".join(f"- {s}" for s in suggestions)
+
+    return f"""{message}
+
+Suggestions :
+{suggestions_text}"""
+
+
+def clean_response(answer):
+    """Nettoie la réponse pour éviter les répétitions et le texte brut."""
+    lines = answer.split('\n')
+    cleaned_lines = []
+    seen_content = set()
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line in seen_content:
+            continue
+        line = re.sub(r'^\[[^\]]*\]\s*', '', line)
+        seen_content.add(line)
+        cleaned_lines.append(line)
+
+    return '\n'.join(cleaned_lines)
+
+
+def add_footer(answer, model_used=None, low_confidence=False):
+    """
+    Ajoute uniquement un message de faible confiance si nécessaire.
+    """
+    if low_confidence:
+        answer += "\n\nRemarque : cette réponse est basée sur des informations partiellement pertinentes. Vous pouvez préciser votre question pour obtenir une réponse plus précise."
+
+    return answer
+
 
 # ==============================
 # APPEL GROQ AVEC RETRY + FALLBACK
@@ -601,8 +647,7 @@ CITED_ARTICLE_PATTERN = re.compile(r"article\s+(\d+)", re.IGNORECASE)
 def _verify_answer(answer, articles_in_context):
     """
     Vérifie que tous les articles cités dans la réponse du LLM font bien
-    partie du contexte fourni. Retourne une note d'avertissement si un
-    article "halluciné" est détecté (cité mais absent du contexte).
+    partie du contexte fourni.
     """
     cited = {int(m) for m in CITED_ARTICLE_PATTERN.findall(answer)}
     unsupported = cited - set(a for a in articles_in_context if isinstance(a, int))
@@ -611,9 +656,9 @@ def _verify_answer(answer, articles_in_context):
         unsupported_str = ", ".join(str(a) for a in sorted(unsupported))
         logger.warning(f"[Verification] Articles cités mais absents du contexte : {unsupported_str}")
         return (
-            f"\n\n⚠️ Vérification automatique : la réponse mentionne l'article "
+            f"\n\nVérification : La réponse mentionne l'article "
             f"{unsupported_str} qui n'apparaît pas dans les documents consultés. "
-            f"Merci de vérifier cette information avant de vous y fier."
+            f"Veuillez vérifier cette information."
         )
     return ""
 
@@ -630,14 +675,35 @@ def ask_legal_ai(question):
 
     documents, corrected_question, low_confidence, max_score = search_documents(question)
 
+    # ==========================
+    # CAS 1 : AUCUN DOCUMENT TROUVÉ
+    # ==========================
+
     if not documents:
-        return (
-            "Je ne trouve pas cette information dans le Code du "
-            "travail malgache. Pouvez-vous reformuler votre question "
-            "ou préciser l'article concerné ?"
+        return add_footer(
+            format_error_response(
+                "Je ne trouve pas cette information dans le Code du travail malgache."
+            ),
+            low_confidence=low_confidence
         )
 
-    # Construction du contexte (format compact, sans doublon avec "SOURCES")
+    # ==========================
+    # CAS 2 : ARTICLE EXACT (ex: "art 13", "article 43")
+    # ==========================
+
+    article_num = _find_article_number(original_question)
+    if article_num is None:
+        article_num = _find_article_number(corrected_question)
+
+    if article_num is not None and len(documents) == 1:
+        content = documents[0].get("page_content", "")
+        response = format_article_response(content, article_num)
+        return add_footer(response, low_confidence=low_confidence)
+
+    # ==========================
+    # CAS 3 : QUESTION GÉNÉRALE OU PRÉCISE
+    # ==========================
+
     context_parts = []
     articles_set = set()
 
@@ -647,68 +713,93 @@ def ask_legal_ai(question):
             metadata = doc.get("metadata", {})
             article = metadata.get("article_num", "inconnu")
             articles_set.add(article)
-            context_parts.append(f"ARTICLE {article}\n{content}")
+            # Nettoyer le contenu pour le contexte
+            content = re.sub(r'^[A-Z\s]+>.*?\n', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'^TITRE\s+[IVXLCDM]+\s*:.*?\n', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'^CHAPITRE\s+[A-Z]+\s*:.*?\n', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'^Section\s+\d+\s*:.*?\n', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'^ARTICLE\s+\d+\s*\n', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'^Art\.?\s+\d+\s*\n', '', content, flags=re.IGNORECASE)
+            context_parts.append(f"ARTICLE {article}\n{content.strip()}")
         else:
             context_parts.append(str(doc))
 
     context = "\n\n".join(context_parts)
-
-    nb_articles = len(articles_set)
     articles_str = ", ".join(str(a) for a in sorted(articles_set) if a != "inconnu")
 
-    prompt = f"""
-Tu es LegalAI, un assistant spécialisé dans le Code du travail malgache.
+    # ==========================
+    # PROMPT SYSTEM - VERSION AMÉLIORÉE
+    # ==========================
 
-Règles STRICTES (à respecter impérativement) :
-- Utilise UNIQUEMENT les articles présents dans le CONTEXTE ci-dessous. N'utilise AUCUNE connaissance externe.
-- Si un droit, une obligation ou un délai n'est pas explicitement mentionné dans les articles fournis, ne l'invente pas et dis-le clairement.
-- Ne transforme jamais une obligation de l'employeur en droit du salarié (ou l'inverse) sans que ce soit écrit noir sur blanc dans le texte fourni.
-- Cite précisément les numéros d'articles que tu utilises ({nb_articles} articles disponibles : {articles_str}).
-- Si la question est générale (ex: "congés"), mentionne tous les articles pertinents parmi ceux fournis, mais uniquement ceux-ci.
-- Structure ta réponse de manière claire et pédagogique.
-- Termine TOUJOURS par une section "Références :" listant les numéros d'articles réellement utilisés.
+    system_prompt = """
+Tu es LegalAI, un assistant juridique spécialisé dans le Code du travail malgache (Loi n°2024-014).
 
-CONTEXTE JURIDIQUE ({nb_articles} articles) :
-{context}
+Règles de réponse :
+- Réponds toujours de manière naturelle, claire et compréhensible pour un utilisateur non juriste.
+- Commence directement par répondre à la question, sans formule d'introduction générique.
+- N'utilise pas de titres en gras ni de structure en sections séparées.
+- N'utilise pas de Markdown, d'émojis ou de caractères spéciaux.
+- Explique d'abord le principe juridique en langage courant, puis intègre les articles qui le justifient directement dans le fil du texte.
+- Reformule les dispositions légales avec tes propres mots pour les rendre plus accessibles, tout en restant fidèle au contenu des articles.
+- Écris toujours "l'article X" en toutes lettres.
 
-QUESTION ORIGINALE :
-{original_question}
+À la fin de chaque réponse, ajoute une seule ligne sous cette forme :
+- Références des articles : 43.
+- Références des articles : 44 et 45.
+- Références des articles : 125, 126 et 130.
 
-QUESTION NORMALISÉE :
-{corrected_question}
-
-RÉPONSE :
+Ne cite que les articles réellement utilisés pour répondre à la question.
+Ne fais jamais apparaître cette ligne deux fois.
+N'invente jamais un article ou un contenu juridique qui n'est pas dans le contexte fourni.
+Si le contexte fourni ne permet pas de répondre précisément, dis-le clairement.
 """
 
-    system_prompt = "Tu es un assistant juridique précis et exhaustif. Tu ne réponds jamais au-delà de ce que dit le texte fourni."
+    # ==========================
+    # PROMPT UTILISATEUR
+    # ==========================
+
+    user_prompt = f"""
+Contexte juridique ({len(articles_set)} articles disponibles : {articles_str}) :
+
+{context}
+
+Question du client : {original_question}
+
+Réponse :"""
 
     try:
-        answer, used_model = call_groq_with_fallback(system_prompt, prompt, max_tokens=DEFAULT_MAX_TOKENS, temperature=0.1)
+        answer, used_model = call_groq_with_fallback(system_prompt, user_prompt, max_tokens=DEFAULT_MAX_TOKENS, temperature=0.1)
 
-        # Vérification anti-hallucination : les articles cités existent-ils dans le contexte ?
-        answer += _verify_answer(answer, articles_set)
+        # Nettoyer la réponse
+        answer = clean_response(answer)
 
-        if low_confidence:
-            answer += (
-                "\n\nℹ️ Remarque : la correspondance trouvée dans le Code du travail est "
-                "assez faible pour cette question. N'hésitez pas à préciser votre demande "
-                "(ex: préciser le sujet exact ou le numéro d'article) pour affiner la réponse."
-            )
+        # Vérifier les articles cités (warning seulement, pas de modification)
+        _verify_answer(answer, articles_set)
 
-        if used_model != PRIMARY_MODEL:
-            answer += f"\n\n_(Réponse générée avec le modèle de secours {used_model} suite à une indisponibilité du modèle principal.)_"
+        # Formater la réponse générale (ne fait que nettoyer)
+        response = format_general_response(answer, articles_set)
 
-        return answer
+        # Ajouter le footer si nécessaire
+        response = add_footer(response, low_confidence=low_confidence)
+
+        return response
 
     except RuntimeError as e:
         logger.error(f"[LegalAI] Échec définitif de la génération : {e}")
-        return f"⚠️ {e}"
+        return add_footer(
+            format_error_response(
+                f"Erreur technique : {e}",
+                ["Réessayer dans quelques instants", "Contacter le support technique"]
+            )
+        )
 
     except Exception:
         logger.exception("[LegalAI] Erreur inattendue lors de la génération")
-        return (
-            "⚠️ Une erreur inattendue est survenue lors de la génération de la "
-            "réponse. Merci de réessayer."
+        return add_footer(
+            format_error_response(
+                "Une erreur inattendue est survenue.",
+                ["Réessayer dans quelques instants", "Reformuler votre question"]
+            )
         )
 
 # ==============================
@@ -716,29 +807,36 @@ RÉPONSE :
 # ==============================
 
 if __name__ == "__main__":
-    print("\n" + "=" * 50)
-    print(" LegalAI - Chatbot Droit du travail malgache")
-    print("=" * 50)
+    print("\n" + "=" * 70)
+    print(" LegalAI - Assistant Juridique du Code du travail malgache")
+    print("=" * 70)
+    print("Posez vos questions sur le droit du travail malgache")
     print("Tapez 'exit' pour quitter\n")
+    print("Exemples de questions :")
+    print("  Article exact   : article 13, art 43, art.58")
+    print("  Question précise: combien de jours de congé par an ?")
+    print("  Question générale: quels sont les motifs de licenciement ?")
+    print("-" * 70 + "\n")
 
     while True:
         try:
             question = input("Vous : ")
         except (KeyboardInterrupt, EOFError):
-            print("\nAu revoir !")
+            print("\n\nAu revoir !")
             break
 
         if question.lower() in ["exit", "quit", "q"]:
-            print("Au revoir !")
+            print("\nAu revoir !")
             break
 
         if question.strip() == "":
             continue
 
+        print("\nRecherche en cours...")
         answer = ask_legal_ai(question)
 
-        print("\n" + "=" * 50)
+        print("\n" + "=" * 70)
         print("LegalAI :")
-        print("=" * 50)
+        print("=" * 70)
         print(answer)
-        print("\n" + "=" * 50 + "\n")
+        print("\n" + "=" * 70 + "\n")

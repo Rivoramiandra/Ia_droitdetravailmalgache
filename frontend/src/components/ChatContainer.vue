@@ -1,5 +1,5 @@
 <script setup>
-import { ref, nextTick, onMounted, watch } from 'vue'  // Ajout de watch
+import { ref, nextTick, onMounted, watch } from 'vue'
 import ChatMessage from './ChatMessage.vue'
 import ChatInput from './ChatInput.vue'
 import Loader from './Loader.vue'
@@ -13,12 +13,8 @@ const props = defineProps({
     }
 })
 
-const messages = ref([
-  {
-    role: 'assistant',
-    text: "Bonjour ! Je suis votre assistant IA. Posez-moi une question pour commencer.",
-  },
-])
+// Messages complètement vides au départ
+const messages = ref([])
 
 const loading = ref(false)
 const scrollEl = ref(null)
@@ -26,13 +22,8 @@ const scrollEl = ref(null)
 // Surveiller les changements de conversationId pour réinitialiser
 watch(() => props.conversationId, (newId, oldId) => {
     if (newId !== oldId) {
-        // Réinitialiser les messages
-        messages.value = [
-            {
-                role: 'assistant',
-                text: "Bonjour ! Je suis votre assistant IA. Posez-moi une question pour commencer.",
-            },
-        ]
+        // Réinitialiser les messages à vide
+        messages.value = []
         // Scroller en haut
         nextTick(() => {
             if (scrollEl.value) scrollEl.value.scrollTop = 0
@@ -72,6 +63,14 @@ onMounted(scrollToBottom)
 <template>
   <div class="chat-container">
     <div ref="scrollEl" class="messages">
+      <!-- Message d'accueil uniquement si aucun message -->
+      <div v-if="messages.length === 0 && !loading" class="empty-state">
+        <div class="empty-icon">💬</div>
+        <h3>Commencez une nouvelle conversation</h3>
+        <p>Posez votre première question à l'assistant</p>
+      </div>
+      
+      <!-- Messages -->
       <ChatMessage
         v-for="(m, i) in messages"
         :key="i"
@@ -109,8 +108,36 @@ onMounted(scrollToBottom)
   scroll-behavior: smooth;
 }
 
+/* Style pour l'état vide */
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #94a3b8;
+  text-align: center;
+  padding: 2rem;
+}
+
+.empty-icon {
+  font-size: 48px;
+  margin-bottom: 15px;
+}
+
+.empty-state h3 {
+  color: #e2e8f0;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.empty-state p {
+  color: #64748b;
+  font-size: 14px;
+}
+
 @media (max-width: 600px) {
-  .chat-container { height: 78vh; border-radius: 14px; }
+  .chat-container { height: 60vh; border-radius: 14px; }
   .messages { padding: 0.9rem; }
 }
 </style>

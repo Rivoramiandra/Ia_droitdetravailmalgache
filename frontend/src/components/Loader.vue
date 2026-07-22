@@ -3,7 +3,7 @@
     <div class="dots">
       <span></span><span></span><span></span>
     </div>
-    <span class="label">L'IA réfléchit…</span>
+    <span class="label"></span>
   </div>
 </template>
 
